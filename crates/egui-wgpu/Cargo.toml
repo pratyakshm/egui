@@ -73,3 +73,15 @@ wgpu = { workspace = true, features = ["wgsl"] }
 
 egui = { workspace = true, optional = true, default-features = false }
 winit = { workspace = true, optional = true, default-features = false }
+
+# Same versions as wgpu-hal 30.0.1 (`objc2` 0.6.3 resolves to the 0.6.4 already in the lockfile).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.3"
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "objc2-core-graphics",
+  "CALayer",
+  "CAMetalLayer",
+  "objc2-metal",
+] }

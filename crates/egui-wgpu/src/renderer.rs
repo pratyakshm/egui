@@ -1,5 +1,7 @@
 use core::{num::NonZeroU64, ops::Range};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::mpsc;
 
 use ahash::HashMap;
 use bytemuck::Zeroable as _;
@@ -233,6 +235,13 @@ impl Default for RendererOptions {
     }
 }
 
+/// Sampler options and texel size for a texture allocated by [`Renderer::update_texture`].
+struct ManagedTextureInfo {
+    options: epaint::textures::TextureOptions,
+    /// Full texture size in texels. Partial updates must not overwrite this.
+    size: [u32; 2],
+}
+
 /// Renderer for a egui based GUI.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
@@ -249,6 +258,11 @@ pub struct Renderer {
     /// sampler). The texture may be None if the `TextureId` is just a handle to a user-provided
     /// sampler.
     textures: HashMap<epaint::TextureId, Texture>,
+    /// Options and size for textures allocated by [`Self::update_texture`].
+    ///
+    /// User-registered textures are not entered. [`Self::snapshot_textures`] reads this
+    /// so a device drop can restore images egui will not resend (it only sends deltas).
+    managed_texture_info: BTreeMap<epaint::TextureId, ManagedTextureInfo>,
     next_user_texture_id: u64,
     samplers: HashMap<epaint::textures::TextureOptions, wgpu::Sampler>,
 
@@ -459,6 +473,7 @@ impl Renderer {
             uniform_bind_group,
             texture_bind_group_layout,
             textures: HashMap::default(),
+            managed_texture_info: BTreeMap::new(),
             next_user_texture_id: 0,
             samplers: HashMap::default(),
             options,
@@ -558,7 +573,7 @@ impl Renderer {
                         );
                         render_pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
                     } else {
-                        log::warn!("Missing texture: {:?}", mesh.texture_id);
+                        log::debug!("Missing texture: {:?}", mesh.texture_id);
                     }
                 }
                 Primitive::Callback(callback) => {
@@ -662,14 +677,15 @@ impl Renderer {
 
         let (texture, origin, bind_group) = if let Some(pos) = image_delta.pos {
             // update the existing texture
-            let Texture {
+            let Some(Texture {
                 texture,
                 bind_group,
                 options,
-            } = self
-                .textures
-                .remove(&id)
-                .expect("Tried to update a texture that has not been allocated yet.");
+            }) = self.textures.remove(&id)
+            else {
+                log::debug!("Tried to update a texture that has not been allocated yet: {id:?}");
+                return;
+            };
             let texture = texture.expect("Tried to update user texture.");
             let options = options.expect("Tried to update user texture.");
             let origin = wgpu::Origin3d {
@@ -700,7 +716,9 @@ impl Renderer {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
                 })
             };
@@ -733,6 +751,26 @@ impl Renderer {
 
         queue_write_data_to_texture(&texture, origin);
 
+        if image_delta.pos.is_none() {
+            self.managed_texture_info.insert(
+                id,
+                ManagedTextureInfo {
+                    options: image_delta.options,
+                    size: [width, height],
+                },
+            );
+        } else if let Some(info) = self.managed_texture_info.get_mut(&id) {
+            info.options = image_delta.options;
+        } else {
+            self.managed_texture_info.insert(
+                id,
+                ManagedTextureInfo {
+                    options: image_delta.options,
+                    size: [texture.width(), texture.height()],
+                },
+            );
+        }
+
         // A full update must (re)create the texture at exactly the delta's size,
         // or glyph UVs (normalized by the CPU atlas size) will sample the wrong rows.
         debug_assert!(
@@ -753,9 +791,242 @@ impl Renderer {
     }
 
     pub fn free_texture(&mut self, id: &epaint::TextureId) {
+        self.managed_texture_info.remove(id);
         if let Some(texture) = self.textures.remove(id).and_then(|t| t.texture) {
             texture.destroy();
         }
+    }
+
+    /// Copy managed textures into [`epaint::ColorImage`]s.
+    ///
+    /// [`epaint::TextureId::default`] (the font atlas) is skipped; the app re-uploads it.
+    /// User textures are absent from the managed map, so they are skipped.
+    /// Every other managed texture is copied, whatever its size: egui sends only
+    /// deltas, so a texture left out here would be missing after the device is
+    /// recreated, for as long as its handle lives. The app should free what it
+    /// can reload before the release. Skipped textures are logged with `log::warn`.
+    pub fn snapshot_textures(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Vec<(
+        epaint::TextureId,
+        epaint::ColorImage,
+        epaint::textures::TextureOptions,
+    )> {
+        profiling::function_scope!();
+
+        struct Pending {
+            id: epaint::TextureId,
+            options: epaint::textures::TextureOptions,
+            width: u32,
+            height: u32,
+            padded_bytes_per_row: u32,
+            buffer: wgpu::Buffer,
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("egui_texture_snapshot"),
+        });
+        let mut pending = Vec::new();
+        let mut total_bytes = 0u64;
+
+        for (id, info) in &self.managed_texture_info {
+            if *id == epaint::TextureId::default() {
+                continue;
+            }
+
+            let Some(texture) = self.textures.get(id).and_then(|tex| tex.texture.as_ref()) else {
+                log::warn!("Skipping texture {id:?} in GPU snapshot: no GPU texture");
+                continue;
+            };
+
+            let [width, height] = info.size;
+            if texture.width() != width || texture.height() != height {
+                log::warn!(
+                    "Skipping texture {id:?} in GPU snapshot: recorded {width}x{height}, GPU texture {}x{}",
+                    texture.width(),
+                    texture.height()
+                );
+                continue;
+            }
+            if width == 0 || height == 0 {
+                log::debug!("Skipping texture {id:?} in GPU snapshot: empty {width}x{height}");
+                continue;
+            }
+
+            let bytes = u64::from(width) * u64::from(height) * 4;
+
+            match texture.format() {
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {}
+                format => {
+                    log::warn!("Skipping texture {id:?} in GPU snapshot: format {format:?}");
+                    continue;
+                }
+            }
+            if !texture.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+                log::warn!("Skipping texture {id:?} in GPU snapshot: missing COPY_SRC");
+                continue;
+            }
+
+            let Some(unpadded_bytes_per_row) = width.checked_mul(4) else {
+                log::warn!("Skipping texture {id:?} in GPU snapshot: row size overflow");
+                continue;
+            };
+            let padded_bytes_per_row =
+                wgpu::util::align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let Some(buffer_size) = u64::from(padded_bytes_per_row).checked_mul(u64::from(height))
+            else {
+                log::warn!("Skipping texture {id:?} in GPU snapshot: buffer size overflow");
+                continue;
+            };
+
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("egui_texture_snapshot"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            total_bytes += bytes;
+            pending.push(Pending {
+                id: *id,
+                options: info.options,
+                width,
+                height,
+                padded_bytes_per_row,
+                buffer,
+            });
+        }
+
+        log::debug!(
+            "GPU snapshot: reading back {} textures, {total_bytes} bytes",
+            pending.len()
+        );
+        if pending.is_empty() {
+            return Vec::new();
+        }
+
+        let submission_index = queue.submit([encoder.finish()]);
+        let mut map_results = Vec::with_capacity(pending.len());
+        for item in &pending {
+            let (tx, rx) = mpsc::channel();
+            item.buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            map_results.push(rx);
+        }
+
+        if let Err(err) = device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        }) {
+            log::warn!("Texture snapshot poll failed: {err}");
+            return Vec::new();
+        }
+
+        let mut snapshots = Vec::with_capacity(pending.len());
+        for (item, rx) in pending.iter().zip(map_results) {
+            match rx.try_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log::warn!(
+                        "Skipping texture {id:?}: snapshot map failed: {err}",
+                        id = item.id
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    log::warn!(
+                        "Skipping texture {id:?}: snapshot map did not finish",
+                        id = item.id
+                    );
+                    continue;
+                }
+            }
+
+            let mapped = match item.buffer.slice(..).get_mapped_range() {
+                Ok(mapped) => mapped,
+                Err(err) => {
+                    log::warn!(
+                        "Skipping texture {id:?}: snapshot mapped range failed: {err}",
+                        id = item.id
+                    );
+                    item.buffer.unmap();
+                    continue;
+                }
+            };
+            let image = Self::color_image_from_padded_rgba8(
+                &mapped,
+                item.width,
+                item.height,
+                item.padded_bytes_per_row,
+            );
+            drop(mapped);
+            item.buffer.unmap();
+            match image {
+                Some(image) => snapshots.push((item.id, image, item.options)),
+                None => {
+                    log::warn!(
+                        "Skipping texture {id:?}: snapshot rows were short",
+                        id = item.id
+                    );
+                }
+            }
+        }
+        snapshots
+    }
+
+    /// Unpad rows aligned to [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`] into [`epaint::ColorImage`].
+    ///
+    /// [`wgpu::TextureFormat::Rgba8Unorm`] and [`wgpu::TextureFormat::Rgba8UnormSrgb`] copy as
+    /// stored 8-bit channels. [`epaint::Color32`] is premultiplied, matching bytes from
+    /// [`Self::update_texture`], so pixels use [`epaint::Color32::from_rgba_premultiplied`].
+    fn color_image_from_padded_rgba8(
+        mapped: &[u8],
+        width: u32,
+        height: u32,
+        padded_bytes_per_row: u32,
+    ) -> Option<epaint::ColorImage> {
+        let width = width as usize;
+        let height = height as usize;
+        let padded = padded_bytes_per_row as usize;
+        let unpadded = width * 4;
+        if unpadded == 0 || padded < unpadded || mapped.len() < padded.saturating_mul(height) {
+            return None;
+        }
+        let mut pixels = Vec::with_capacity(width * height);
+        for row in 0..height {
+            let start = row * padded;
+            let row_bytes = &mapped[start..start + unpadded];
+            for px in row_bytes.chunks_exact(4) {
+                let &[r, g, b, a] = px else {
+                    continue;
+                };
+                pixels.push(epaint::Color32::from_rgba_premultiplied(r, g, b, a));
+            }
+        }
+        if pixels.len() != width * height {
+            return None;
+        }
+        Some(epaint::ColorImage::new([width, height], pixels))
     }
 
     /// Get the WGPU texture and bind group associated to a texture that has been allocated by egui.

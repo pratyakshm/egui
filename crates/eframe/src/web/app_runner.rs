@@ -138,6 +138,8 @@ impl AppRunner {
 
             #[cfg(feature = "wgpu_no_default_features")]
             wgpu_render_state,
+            gpu_state: epi::GpuState::Active,
+            gpu_request: epi::GpuRequest::None,
         };
 
         let needs_repaint: Arc<NeedRepaint> = Arc::new(NeedRepaint::new(web_options.max_fps));

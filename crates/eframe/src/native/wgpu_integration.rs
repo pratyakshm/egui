@@ -29,6 +29,7 @@ use winit_integration::UserEvent;
 
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
+    epi::{GpuRequest, GpuState},
     native::{
         epi_integration::EpiIntegration,
         winit_integration::{EventResult, sleep_if_invisible_or_minimized},
@@ -90,6 +91,8 @@ pub struct SharedState {
     viewport_from_window: HashMap<WindowId, ViewportId>,
     focused_viewport: Option<ViewportId>,
     resized_viewport: Option<ViewportId>,
+    gpu_state: GpuState,
+    awaiting_surface_restore: bool,
 }
 
 pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
@@ -360,6 +363,8 @@ impl<'app> WgpuWinitApp<'app> {
             painter,
             focused_viewport: Some(ViewportId::ROOT),
             resized_viewport: None,
+            gpu_state: GpuState::Active,
+            awaiting_surface_restore: false,
         }));
 
         {
@@ -640,12 +645,16 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (viewport_ui_cb, raw_input, is_visible, show_ui) = {
+        let (viewport_ui_cb, raw_input, is_visible, show_ui, gpu_released, entered_low_res) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
             let SharedState {
-                viewports, painter, ..
+                viewports,
+                painter,
+                gpu_state,
+                awaiting_surface_restore,
+                ..
             } = &mut *shared_lock;
 
             if viewport_id != ViewportId::ROOT {
@@ -686,9 +695,59 @@ impl WgpuWinitRunning<'_> {
 
             let is_visible = viewport.info.visible().unwrap_or(true);
 
-            {
+            // Child surfaces must not consume the post-restore `set_window`:
+            // the first one recreates the device on the stashed root layer.
+            if *awaiting_surface_restore && viewport_id != ViewportId::ROOT {
+                integration
+                    .egui_ctx
+                    .request_repaint_of(egui::ViewportId::ROOT);
+                return Ok(EventResult::Wait);
+            }
+            let mut restored_device = false;
+            if *awaiting_surface_restore {
+                profiling::scope!("set_window");
+                *awaiting_surface_restore = false;
+                match pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))
+                {
+                    Err(err) => {
+                        // Back to released, so `App::logic` keeps running.
+                        // The next wake tries again; there is no retry loop.
+                        log::error!("gpu restore set_window failed: {err}");
+                        painter.release_gpu();
+                        *gpu_state = GpuState::Released;
+                    }
+                    Ok(()) => {
+                        restored_device = true;
+                        integration.frame.wgpu_render_state = painter.render_state();
+                        // egui never resends the font atlas, so upload it whole now,
+                        // not through `pending_deltas`: an immediate viewport can
+                        // paint before the root does.
+                        if let Some(render_state) = painter.render_state() {
+                            let font_delta = integration.egui_ctx.fonts(|fonts| {
+                                egui::epaint::ImageDelta::full(
+                                    fonts.image(),
+                                    egui::epaint::TextureAtlas::texture_options(),
+                                )
+                            });
+                            render_state.renderer.write().update_texture(
+                                &render_state.device,
+                                &render_state.queue,
+                                egui::TextureId::default(),
+                                &font_delta,
+                            );
+                        }
+                    }
+                }
+            } else if *gpu_state != GpuState::Released {
                 profiling::scope!("set_window");
                 pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))?;
+            }
+            let gpu_released = *gpu_state == GpuState::Released;
+            let entered_low_res = *gpu_state == GpuState::LowRes;
+            // A wake from input changes the state between passes; every root pass,
+            // including the logic-only ones, reports it as it is now.
+            if viewport_id == ViewportId::ROOT {
+                integration.frame.gpu_state = *gpu_state;
             }
 
             let Some(egui_winit) = egui_winit.as_mut() else {
@@ -707,10 +766,90 @@ impl WgpuWinitRunning<'_> {
                 .map(|(id, viewport)| (*id, viewport.info.clone()))
                 .collect();
 
+            if restored_device {
+                // Deferred viewports waited for the root; paint them all again.
+                for id in viewports.keys() {
+                    integration.egui_ctx.request_repaint_of(*id);
+                }
+            }
+
             painter.handle_screenshots(&mut raw_input.events);
 
-            (viewport_ui_cb, raw_input, is_visible, show_ui)
+            (
+                viewport_ui_cb,
+                raw_input,
+                is_visible,
+                show_ui,
+                gpu_released,
+                entered_low_res,
+            )
         };
+
+        if gpu_released {
+            if viewport_ui_cb.is_some() {
+                return Ok(EventResult::Wait);
+            }
+            integration.frame.gpu_state = GpuState::Released;
+            integration.frame.wgpu_render_state = None;
+            let egui::LogicOutput {
+                platform_output,
+                viewport_commands,
+            } = integration.update_logic_only(app.as_mut(), raw_input);
+
+            let textures_delta = integration.egui_ctx.tex_manager().write().take_delta();
+
+            {
+                let mut shared_mut = shared.borrow_mut();
+                accumulate_textures_while_gpu_released(
+                    &mut shared_mut.painter,
+                    pending_deltas,
+                    textures_delta,
+                );
+                let _restored = apply_restore_request(&mut shared_mut, &mut integration.frame);
+                apply_release_request(&mut shared_mut, &mut integration.frame);
+            }
+
+            let mut shared_mut = shared.borrow_mut();
+            let SharedState {
+                viewports,
+                egui_ctx,
+                ..
+            } = &mut *shared_mut;
+
+            if let Some(viewport) = viewports.get_mut(&viewport_id) {
+                viewport.info.events.clear();
+                if let Viewport {
+                    window: Some(window),
+                    egui_winit: Some(egui_winit),
+                    ..
+                } = viewport
+                {
+                    egui_winit.handle_platform_output_with_event_loop(
+                        window,
+                        event_loop,
+                        platform_output,
+                    );
+                }
+            }
+
+            for (id, commands) in viewport_commands {
+                if let Some(viewport) = viewports.get_mut(&id) {
+                    viewport.process_commands(egui_ctx, commands);
+                }
+            }
+
+            sleep_if_invisible_or_minimized(
+                viewports
+                    .get(&viewport_id)
+                    .and_then(|viewport| viewport.window.as_deref()),
+            );
+
+            return Ok(if integration.should_close() {
+                EventResult::CloseRequested
+            } else {
+                EventResult::Wait
+            });
+        }
 
         if !show_ui {
             // Nothing will be shown, so we run no egui pass at all.
@@ -748,6 +887,13 @@ impl WgpuWinitRunning<'_> {
                         viewport.process_commands(&integration.egui_ctx, commands);
                     }
                 }
+                apply_restore_request(&mut shared_mut, &mut integration.frame);
+                apply_release_request(&mut shared_mut, &mut integration.frame);
+                // Nothing is shown, so there is no half-resolution frame to wait
+                // for: a covered or minimized window lets the device go now.
+                if shared_mut.gpu_state == GpuState::LowRes {
+                    maybe_release_gpu_after_low_res_paint(&mut shared_mut, &mut integration.frame);
+                }
             }
 
             sleep_if_invisible_or_minimized(
@@ -769,10 +915,25 @@ impl WgpuWinitRunning<'_> {
 
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
+        let is_root_viewport = viewport_ui_cb.is_none();
+        if is_root_viewport {
+            integration.frame.gpu_state = shared.borrow().gpu_state;
+        }
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+
+        // Restore before paint so a wake during this pass is not painted at half res
+        // and then released. Release is applied after paint: this pass stays full res,
+        // `request_repaint` runs the half-res pass, and that pass is what releases.
+        let restore_handled = if is_root_viewport {
+            let mut shared_mut = shared.borrow_mut();
+            apply_restore_request(&mut shared_mut, &mut integration.frame)
+        } else {
+            false
+        };
 
         // ------------------------------------------------------------
 
+        let mut low_res_paint_ok = false;
         let mut shared_mut = shared.borrow_mut();
 
         let SharedState {
@@ -824,6 +985,7 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
+            let had_render_state = painter.render_state().is_some();
             let vsync_secs = painter.paint_and_update_textures(
                 viewport_id,
                 pixels_per_point,
@@ -833,6 +995,15 @@ impl WgpuWinitRunning<'_> {
                 screenshot_commands,
                 window,
             );
+            let paint_succeeded =
+                had_render_state && painter.render_state().is_some() && !painter.is_released();
+            if is_root_viewport && entered_low_res && !restore_handled {
+                if paint_succeeded {
+                    low_res_paint_ok = true;
+                } else {
+                    egui_ctx.request_repaint();
+                }
+            }
 
             for action in viewport.actions_requested.drain(..) {
                 match action {
@@ -863,6 +1034,10 @@ impl WgpuWinitRunning<'_> {
 
             vsync_secs
         } else {
+            // Nothing of this viewport is shown, so no half-resolution frame is needed.
+            if is_root_viewport && entered_low_res && !restore_handled {
+                low_res_paint_ok = true;
+            }
             0.0
         };
 
@@ -891,6 +1066,13 @@ impl WgpuWinitRunning<'_> {
         integration.maybe_autosave(app.as_mut(), window.map(|w| w.as_ref()));
 
         sleep_if_invisible_or_minimized(window.map(|window| window.as_ref()));
+
+        if is_root_viewport && low_res_paint_ok {
+            maybe_release_gpu_after_low_res_paint(&mut shared_mut, &mut integration.frame);
+        }
+        if is_root_viewport {
+            apply_release_request(&mut shared_mut, &mut integration.frame);
+        }
 
         if integration.should_close() {
             Ok(EventResult::CloseRequested)
@@ -938,6 +1120,10 @@ impl WgpuWinitRunning<'_> {
         // See: https://github.com/emilk/egui/issues/903
         let event_keeps_resize_active = matches!(event, winit::event::WindowEvent::Resized(_))
             || (cfg!(target_os = "macos") && matches!(event, winit::event::WindowEvent::Moved(_)));
+
+        if window_event_wakes_gpu(event) {
+            wake_gpu_from_user_input(&mut shared);
+        }
 
         if !event_keeps_resize_active
             && let Some(id) = viewport_id
@@ -1090,8 +1276,10 @@ impl Viewport {
 
                 let window = Arc::new(window);
 
-                if let Err(err) =
-                    pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(&window))))
+                if !painter.is_released()
+                    && let Err(err) = pollster::block_on(
+                        painter.set_window(viewport_id, Some(Arc::clone(&window))),
+                    )
                 {
                     log::error!("on set_window: viewport_id {viewport_id:?} {err}");
                 }
@@ -1162,6 +1350,10 @@ fn render_immediate_viewport(
     immediate_viewport: ImmediateViewport<'_>,
 ) {
     profiling::function_scope!();
+
+    // No early return while the GPU is released: egui panics when the
+    // callback is never called. `set_window` and `paint_and_update_textures`
+    // do nothing without a device, and the deltas wait in `pending_delta`.
 
     let ImmediateViewport {
         ids,
@@ -1274,6 +1466,132 @@ fn render_immediate_viewport(
         painter,
         viewport_from_window,
     );
+}
+
+fn window_event_wakes_gpu(event: &winit::event::WindowEvent) -> bool {
+    use winit::event::WindowEvent;
+
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { .. }
+            | WindowEvent::Ime(_)
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::Focused(true)
+            | WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+            | WindowEvent::Occluded(false)
+            | WindowEvent::DroppedFile(_)
+            | WindowEvent::HoveredFile(_)
+            | WindowEvent::Touch(_)
+            | WindowEvent::PinchGesture { .. }
+            | WindowEvent::PanGesture { .. }
+            | WindowEvent::RotationGesture { .. }
+            | WindowEvent::DoubleTapGesture { .. }
+            | WindowEvent::TouchpadPressure { .. }
+            | WindowEvent::ThemeChanged(_)
+    )
+}
+
+fn wake_gpu_from_user_input(shared: &mut SharedState) {
+    let wake = matches!(shared.gpu_state, GpuState::LowRes | GpuState::Released);
+    if wake {
+        restore_gpu_state(shared);
+    }
+}
+
+/// Honor [`GpuRequest::Restore`] before paint. Leaves a release request for after paint.
+fn apply_restore_request(shared: &mut SharedState, frame: &mut crate::epi::Frame) -> bool {
+    if frame.gpu_request != GpuRequest::Restore {
+        return false;
+    }
+    frame.gpu_request = GpuRequest::None;
+    let restored = restore_gpu_state(shared);
+    if restored {
+        frame.gpu_state = GpuState::Active;
+    }
+    restored
+}
+
+/// Honor [`GpuRequest::Release`] after this pass has painted at full resolution.
+///
+/// The half-resolution paint is the following pass (`request_repaint`). Non-macOS ignores it.
+fn apply_release_request(shared: &mut SharedState, frame: &mut crate::epi::Frame) {
+    if frame.gpu_request != GpuRequest::Release {
+        return;
+    }
+    frame.gpu_request = GpuRequest::None;
+    if shared.gpu_state == GpuState::Active && cfg!(target_os = "macos") {
+        shared.painter.set_low_res(true);
+        shared.gpu_state = GpuState::LowRes;
+        frame.gpu_state = GpuState::LowRes;
+        log::debug!("gpu state {:?}", shared.gpu_state);
+        shared.egui_ctx.request_repaint();
+    }
+}
+
+fn restore_gpu_state(shared: &mut SharedState) -> bool {
+    match shared.gpu_state {
+        GpuState::Active => false,
+        GpuState::LowRes => {
+            shared.painter.set_low_res(false);
+            shared.gpu_state = GpuState::Active;
+            log::debug!("gpu state {:?}", shared.gpu_state);
+            shared.egui_ctx.request_repaint();
+            true
+        }
+        GpuState::Released => {
+            shared.painter.set_low_res(false);
+            let t0 = Instant::now();
+            shared.painter.restore_gpu();
+            shared.gpu_state = GpuState::Active;
+            shared.awaiting_surface_restore = true;
+            log::debug!(
+                "gpu state {:?}: restore took {:?}",
+                shared.gpu_state,
+                t0.elapsed()
+            );
+            shared.egui_ctx.request_repaint();
+            true
+        }
+    }
+}
+
+fn maybe_release_gpu_after_low_res_paint(shared: &mut SharedState, frame: &mut crate::epi::Frame) {
+    if shared.gpu_state != GpuState::LowRes {
+        return;
+    }
+    let t0 = Instant::now();
+    shared.painter.release_gpu();
+    shared.gpu_state = GpuState::Released;
+    frame.gpu_state = GpuState::Released;
+    frame.wgpu_render_state = None;
+    log::debug!(
+        "gpu state {:?}: release took {:?}",
+        shared.gpu_state,
+        t0.elapsed()
+    );
+    // One logic pass that sees `Released`, so the app can free what it would reload.
+    shared.egui_ctx.request_repaint();
+}
+
+/// Keep deltas made while the device is gone for the first paint after restore.
+///
+/// A freed texture is dropped from the painter's snapshot too, so it is not uploaded again.
+/// `append` keeps partial updates in order (inserting a whole entry would drop earlier ones).
+/// Moving fields out of `textures_delta` is not allowed: [`TexturesDelta`] implements `Drop`.
+fn accumulate_textures_while_gpu_released(
+    painter: &mut egui_wgpu::winit::Painter,
+    pending_deltas: &mut TexturesDelta,
+    textures_delta: TexturesDelta,
+) {
+    #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
+    for id in &textures_delta.free {
+        painter.forget_snapshot_texture(*id);
+    }
+    pending_deltas.append(textures_delta);
 }
 
 pub(crate) fn remove_viewports_not_in(
@@ -1394,6 +1712,7 @@ fn initialize_or_update_viewport<'a>(
                 );
                 viewport.window = None;
                 viewport.egui_winit = None;
+                // Also while released: it forgets the old window's stashed layer.
                 if let Err(err) = pollster::block_on(painter.set_window(viewport.ids.this, None)) {
                     log::error!(
                         "when rendering viewport_id={:?}, set_window Error {err}",

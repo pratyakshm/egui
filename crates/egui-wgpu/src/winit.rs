@@ -12,6 +12,11 @@ use core::num::NonZeroU32;
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::sync::Arc;
 
+#[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+use objc2::rc::Retained;
+#[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+use objc2_quartz_core::CAMetalLayer;
+
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
     alpha_mode: wgpu::CompositeAlphaMode,
@@ -19,7 +24,12 @@ struct SurfaceState {
     height: u32,
     resizing: bool,
     needs_reconfigure: bool,
+    views_are_low_res: bool,
     needs_recreate: bool,
+    /// Present when the surface was created from a stashed `CAMetalLayer`.
+    /// `create_surface_unsafe` does not keep the window alive; `create_surface` does.
+    #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+    window: Option<Arc<winit::window::Window>>,
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -36,6 +46,17 @@ pub struct Painter {
 
     instance: wgpu::Instance,
     render_state: Option<RenderState>,
+    /// Set by [`Self::release_gpu`]. Cleared by [`Self::restore_gpu`].
+    released: bool,
+    /// Managed textures read back by [`Self::release_gpu`]. Uploaded when the next
+    /// device is created, then cleared. Freed ids are dropped by [`Self::forget_snapshot_texture`].
+    snapshot: Vec<(egui::TextureId, egui::ColorImage, egui::TextureOptions)>,
+    /// Half-res painting; surfaces stay stored at full window size.
+    low_res: bool,
+    /// `CAMetalLayer`s kept across [`Self::release_gpu`] so the next surface
+    /// reuses them. `wgpu/metal` comes from `macos-window-resize-jitter-fix`.
+    #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+    released_layers: ViewportIdMap<Retained<CAMetalLayer>>,
 
     // Per viewport/window:
     depth_texture_view: ViewportIdMap<wgpu::TextureView>,
@@ -76,6 +97,11 @@ impl Painter {
 
             instance,
             render_state: None,
+            released: false,
+            snapshot: Vec::new(),
+            low_res: false,
+            #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+            released_layers: Default::default(),
 
             depth_texture_view: Default::default(),
             surfaces: Default::default(),
@@ -93,10 +119,19 @@ impl Painter {
         self.render_state.clone()
     }
 
+    fn paint_size(width: u32, height: u32, low_res: bool) -> (u32, u32) {
+        if low_res {
+            ((width / 2).max(1), (height / 2).max(1))
+        } else {
+            (width, height)
+        }
+    }
+
     fn configure_surface(
         surface_state: &SurfaceState,
         render_state: &RenderState,
         config: &SurfaceConfig,
+        low_res: bool,
     ) {
         profiling::function_scope!();
 
@@ -114,8 +149,10 @@ impl Painter {
             desired_maximum_frame_latency
         };
 
-        let width = surface_state.width;
-        let height = surface_state.height;
+        // Half-res passes the smaller size into the surface config; CAMetalLayer
+        // drawableSize follows that config and the layer scales it to the view.
+        // Do not set drawableSize yourself.
+        let (width, height) = Self::paint_size(surface_state.width, surface_state.height, low_res);
 
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -138,8 +175,9 @@ impl Painter {
             .configure(&render_state.device, &surf_config);
     }
 
-    /// Drop the existing [`wgpu::Surface`] for `viewport_id` and create a fresh one for the
-    /// given window via [`wgpu::Instance::create_surface`], then configure it.
+    /// Drop the existing [`wgpu::Surface`] for `viewport_id` and create a fresh one, then configure it.
+    ///
+    /// On macOS the fresh surface uses the previous surface's `CAMetalLayer`.
     ///
     /// Used to recover from [`wgpu::CurrentSurfaceTexture::Lost`], where reconfiguring the
     /// existing surface object cannot recover.
@@ -154,6 +192,26 @@ impl Painter {
             return Ok(());
         };
 
+        #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+        let mut reused_layer = false;
+        #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+        let surface = if let Some(layer) = Self::metal_layer_from_surface(&old_state.surface) {
+            match Self::surface_from_metal_layer(&self.instance, &layer) {
+                Ok(surface) => {
+                    reused_layer = true;
+                    surface
+                }
+                Err(err) => {
+                    // `old_state` drops the wgpu surface on return. Keep the layer
+                    // so the next `set_window` does not insert another sublayer.
+                    self.released_layers.insert(viewport_id, layer);
+                    return Err(err);
+                }
+            }
+        } else {
+            self.instance.create_surface(Arc::clone(window))?
+        };
+        #[cfg(not(all(target_os = "macos", feature = "macos-window-resize-jitter-fix")))]
         let surface = self.instance.create_surface(Arc::clone(window))?;
         self.install_surface(
             surface,
@@ -162,7 +220,41 @@ impl Painter {
             old_state.height,
             old_state.resizing,
         );
+        #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+        if reused_layer && let Some(surface_state) = self.surfaces.get_mut(&viewport_id) {
+            surface_state.window = Some(Arc::clone(window));
+        }
         Ok(())
+    }
+
+    /// `CAMetalLayer` stored on this surface, retained so it outlives the surface.
+    #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+    fn metal_layer_from_surface(surface: &wgpu::Surface<'_>) -> Option<Retained<CAMetalLayer>> {
+        // SAFETY: the hal surface is only read here, and dropped before `surface` is touched again.
+        let hal_surface = unsafe { surface.as_hal::<wgpu::hal::api::Metal>() }?;
+        Some(hal_surface.render_layer().lock().clone())
+    }
+
+    /// Build a surface on an existing `CAMetalLayer`.
+    ///
+    /// `Retained::as_ptr` is `*const`. `into_raw` on a clone is `*mut` without a
+    /// const-to-mut cast. `create_surface_from_layer` retains the layer itself;
+    /// the clone's retain is dropped once that has happened.
+    #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+    fn surface_from_metal_layer(
+        instance: &wgpu::Instance,
+        layer: &Retained<CAMetalLayer>,
+    ) -> Result<wgpu::Surface<'static>, crate::WgpuError> {
+        let ptr = Retained::into_raw(layer.clone());
+        // SAFETY: `ptr` is a live `CAMetalLayer`, retained by the clone until after this call.
+        let result = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
+                ptr.cast::<core::ffi::c_void>(),
+            ))
+        };
+        // SAFETY: `ptr` came from `Retained::into_raw` above and is released exactly once.
+        drop(unsafe { Retained::from_raw(ptr) });
+        Ok(result?)
     }
 
     /// Updates (or clears) the [`winit::window::Window`] associated with the [`Painter`]
@@ -194,14 +286,38 @@ impl Painter {
         profiling::scope!("Painter::set_window"); // profile_function gives bad names for async functions
 
         if let Some(window) = window {
+            if self.released {
+                return Ok(());
+            }
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
+                #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+                let stashed = self.released_layers.get(&viewport_id).cloned();
+                #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+                let surface = if let Some(layer) = &stashed {
+                    Self::surface_from_metal_layer(&self.instance, layer)?
+                } else {
+                    self.instance.create_surface(Arc::clone(&window))?
+                };
+                #[cfg(not(all(target_os = "macos", feature = "macos-window-resize-jitter-fix")))]
                 let surface = self.instance.create_surface(window)?;
                 self.add_surface(surface, viewport_id, size).await?;
+                #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+                {
+                    if stashed.is_some()
+                        && let Some(surface_state) = self.surfaces.get_mut(&viewport_id)
+                    {
+                        surface_state.window = Some(window);
+                    }
+                    self.released_layers.remove(&viewport_id);
+                }
             }
         } else {
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
+            // The window this layer belonged to is gone; a new window gets a new layer.
+            #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+            self.released_layers.remove(&viewport_id);
         }
         Ok(())
     }
@@ -220,17 +336,37 @@ impl Painter {
         profiling::scope!("Painter::set_window_unsafe"); // profile_function gives bad names for async functions
 
         if let Some(window) = window {
+            if self.released {
+                return Ok(());
+            }
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
+                #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+                let stashed = self.released_layers.get(&viewport_id).cloned();
+                #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+                let surface = if let Some(layer) = &stashed {
+                    Self::surface_from_metal_layer(&self.instance, layer)?
+                } else {
+                    unsafe {
+                        self.instance.create_surface_unsafe(
+                            wgpu::SurfaceTargetUnsafe::from_window(&window)?,
+                        )?
+                    }
+                };
+                #[cfg(not(all(target_os = "macos", feature = "macos-window-resize-jitter-fix")))]
                 let surface = unsafe {
                     self.instance
                         .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&window)?)?
                 };
                 self.add_surface(surface, viewport_id, size).await?;
+                #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+                self.released_layers.remove(&viewport_id);
             }
         } else {
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
+            #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+            self.released_layers.remove(&viewport_id);
         }
         Ok(())
     }
@@ -241,11 +377,15 @@ impl Painter {
         viewport_id: ViewportId,
         size: winit::dpi::PhysicalSize<u32>,
     ) -> Result<(), crate::WgpuError> {
+        if self.released {
+            return Ok(());
+        }
         if self.render_state.is_none() {
             let render_state =
                 RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
                     .await?;
             self.render_state = Some(render_state);
+            self.upload_texture_snapshot();
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);
         Ok(())
@@ -297,7 +437,10 @@ impl Painter {
                 alpha_mode,
                 resizing,
                 needs_reconfigure: false,
+                views_are_low_res: false,
                 needs_recreate: false,
+                #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+                window: None,
             },
         );
         let Some(width) = NonZeroU32::new(width) else {
@@ -322,30 +465,22 @@ impl Painter {
             .map(|rs| rs.device.limits().max_texture_dimension_2d as usize)
     }
 
-    fn resize_and_generate_depth_texture_view_and_msaa_view(
-        &mut self,
+    #[expect(clippy::too_many_arguments)]
+    fn create_depth_and_msaa_views(
+        device: &wgpu::Device,
+        depth_format: Option<wgpu::TextureFormat>,
+        msaa_samples: u32,
+        target_format: wgpu::TextureFormat,
         viewport_id: ViewportId,
-        width_in_pixels: NonZeroU32,
-        height_in_pixels: NonZeroU32,
+        width: u32,
+        height: u32,
+        depth_texture_view: &mut ViewportIdMap<wgpu::TextureView>,
+        msaa_texture_view: &mut ViewportIdMap<wgpu::TextureView>,
     ) {
-        profiling::function_scope!();
-
-        let width = width_in_pixels.get();
-        let height = height_in_pixels.get();
-
-        let render_state = self.render_state.as_ref().unwrap();
-        let surface_state = self.surfaces.get_mut(&viewport_id).unwrap();
-
-        surface_state.width = width;
-        surface_state.height = height;
-
-        Self::configure_surface(surface_state, render_state, &self.config.surface);
-
-        if let Some(depth_format) = self.options.depth_stencil_format {
-            self.depth_texture_view.insert(
+        if let Some(depth_format) = depth_format {
+            depth_texture_view.insert(
                 viewport_id,
-                render_state
-                    .device
+                device
                     .create_texture(&wgpu::TextureDescriptor {
                         label: Some("egui_depth_texture"),
                         size: wgpu::Extent3d {
@@ -354,7 +489,7 @@ impl Painter {
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
-                        sample_count: self.options.msaa_samples.max(1),
+                        sample_count: msaa_samples.max(1),
                         dimension: wgpu::TextureDimension::D2,
                         format: depth_format,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -365,15 +500,10 @@ impl Painter {
             );
         }
 
-        if let Some(render_state) = (self.options.msaa_samples > 1)
-            .then_some(self.render_state.as_ref())
-            .flatten()
-        {
-            let texture_format = render_state.target_format;
-            self.msaa_texture_view.insert(
+        if msaa_samples > 1 {
+            msaa_texture_view.insert(
                 viewport_id,
-                render_state
-                    .device
+                device
                     .create_texture(&wgpu::TextureDescriptor {
                         label: Some("egui_msaa_texture"),
                         size: wgpu::Extent3d {
@@ -382,15 +512,58 @@ impl Painter {
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
-                        sample_count: self.options.msaa_samples.max(1),
+                        sample_count: msaa_samples.max(1),
                         dimension: wgpu::TextureDimension::D2,
-                        format: texture_format,
+                        format: target_format,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        view_formats: &[texture_format],
+                        view_formats: &[target_format],
                     })
                     .create_view(&wgpu::TextureViewDescriptor::default()),
             );
         }
+    }
+
+    fn resize_and_generate_depth_texture_view_and_msaa_view(
+        &mut self,
+        viewport_id: ViewportId,
+        width_in_pixels: NonZeroU32,
+        height_in_pixels: NonZeroU32,
+    ) {
+        profiling::function_scope!();
+
+        let width = width_in_pixels.get();
+        let height = height_in_pixels.get();
+        let low_res = self.low_res;
+        let depth_format = self.options.depth_stencil_format;
+        let msaa_samples = self.options.msaa_samples;
+
+        let target_format = {
+            let render_state = self.render_state.as_ref().unwrap();
+            let surface_state = self.surfaces.get_mut(&viewport_id).unwrap();
+
+            surface_state.width = width;
+            surface_state.height = height;
+
+            Self::configure_surface(surface_state, render_state, &self.config.surface, low_res);
+            render_state.target_format
+        };
+
+        let (tex_w, tex_h) = Self::paint_size(width, height, low_res);
+        Self::create_depth_and_msaa_views(
+            &self.render_state.as_ref().unwrap().device,
+            depth_format,
+            msaa_samples,
+            target_format,
+            viewport_id,
+            tex_w,
+            tex_h,
+            &mut self.depth_texture_view,
+            &mut self.msaa_texture_view,
+        );
+        self.surfaces
+            .get_mut(&viewport_id)
+            .unwrap()
+            .views_are_low_res = low_res;
     }
 
     /// Handles changes of the resizing state.
@@ -439,7 +612,12 @@ impl Painter {
                         .lock()
                         .setPresentsWithTransaction(resizing);
 
-                    Self::configure_surface(state, render_state, &self.config.surface);
+                    Self::configure_surface(
+                        state,
+                        render_state,
+                        &self.config.surface,
+                        self.low_res,
+                    );
                 }
             }
         }
@@ -507,6 +685,8 @@ impl Painter {
             }
         }
 
+        // At half resolution the screenshot is half size: `CaptureState` follows the
+        // surface texture. Dropping the request would leave its sender waiting.
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;
 
@@ -546,6 +726,7 @@ impl Painter {
             commands_submitted: false,
         };
 
+        let low_res = self.low_res;
         let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
             return vsync_sec;
         };
@@ -558,9 +739,15 @@ impl Painter {
                 });
 
         // Upload all resources for the GPU.
+        let (paint_w, paint_h) =
+            Self::paint_size(surface_state.width, surface_state.height, low_res);
         let screen_descriptor = renderer::ScreenDescriptor {
-            size_in_pixels: [surface_state.width, surface_state.height],
-            pixels_per_point,
+            size_in_pixels: [paint_w, paint_h],
+            pixels_per_point: if low_res {
+                pixels_per_point / 2.0
+            } else {
+                pixels_per_point
+            },
         };
 
         let user_cmd_bufs = {
@@ -587,8 +774,29 @@ impl Painter {
         };
 
         if surface_state.needs_reconfigure {
-            Self::configure_surface(surface_state, render_state, &self.config.surface);
+            let low_res = self.low_res;
+            let recreate_views = surface_state.views_are_low_res != low_res;
+            let (tex_w, tex_h) =
+                Self::paint_size(surface_state.width, surface_state.height, low_res);
+            Self::configure_surface(surface_state, render_state, &self.config.surface, low_res);
             surface_state.needs_reconfigure = false;
+            if recreate_views {
+                surface_state.views_are_low_res = low_res;
+                let depth_format = self.options.depth_stencil_format;
+                let msaa_samples = self.options.msaa_samples;
+                let target_format = render_state.target_format;
+                Self::create_depth_and_msaa_views(
+                    &render_state.device,
+                    depth_format,
+                    msaa_samples,
+                    target_format,
+                    viewport_id,
+                    tex_w,
+                    tex_h,
+                    &mut self.depth_texture_view,
+                    &mut self.msaa_texture_view,
+                );
+            }
         }
 
         let output_frame = {
@@ -609,7 +817,12 @@ impl Painter {
             other => {
                 match (*self.config.on_surface_status)(&other) {
                     SurfaceErrorAction::Reconfigure => {
-                        Self::configure_surface(surface_state, render_state, &self.config.surface);
+                        Self::configure_surface(
+                            surface_state,
+                            render_state,
+                            &self.config.surface,
+                            self.low_res,
+                        );
                         self.context.request_repaint_of(viewport_id);
                     }
                     SurfaceErrorAction::RecreateSurface => {
@@ -791,10 +1004,134 @@ impl Painter {
             .retain(|id, _| active_viewports.contains(id));
         self.msaa_texture_view
             .retain(|id, _| active_viewports.contains(id));
+        #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+        self.released_layers
+            .retain(|id, _| active_viewports.contains(id));
     }
 
-    #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
+    /// Paint into a half-size drawable when `low` is true, full size when false.
+    ///
+    /// `SurfaceState` keeps the full window size. When the value changes, every
+    /// surface is marked so the next paint configures it and recreates depth and
+    /// MSAA views at half or full size. Passing the current value does nothing.
+    pub fn set_low_res(&mut self, low: bool) {
+        if self.low_res == low {
+            return;
+        }
+        self.low_res = low;
+        #[expect(clippy::iter_over_hash_type)]
+        for surface in self.surfaces.values_mut() {
+            surface.needs_reconfigure = true;
+        }
+    }
+
+    /// Whether [`Self::set_low_res`] is on.
+    pub fn is_low_res(&self) -> bool {
+        self.low_res
+    }
+
+    /// Drop the device and every surface so the GPU can idle.
+    ///
+    /// On macOS each viewport's `CAMetalLayer` stays attached to its view.
+    /// Layer contents are left as they are, so the last frame stays on screen.
+    /// [`Self::restore_gpu`] lets the next [`Self::set_window`] build a new device
+    /// on those layers.
+    ///
+    /// Managed textures except the font atlas are read back before the device is dropped
+    /// and uploaded again the next time a device is created.
+    pub fn release_gpu(&mut self) {
+        if self.render_state.is_some() {
+            let poll_result = self
+                .render_state
+                .as_ref()
+                .unwrap()
+                .device
+                .poll(wgpu::PollType::wait_indefinitely());
+            if let Err(err) = poll_result {
+                log::warn!("Device poll before GPU release failed: {err}");
+            }
+
+            let snapshot = if let Some(render_state) = self.render_state.as_ref() {
+                let renderer = render_state.renderer.read();
+                renderer.snapshot_textures(&render_state.device, &render_state.queue)
+            } else {
+                Vec::new()
+            };
+            self.snapshot = snapshot;
+
+            #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+            {
+                let surfaces = std::mem::take(&mut self.surfaces);
+                #[expect(clippy::iter_over_hash_type)]
+                for (viewport_id, surface_state) in &surfaces {
+                    // Field is a keepalive `Arc`. Read it so it is not dead_code.
+                    let _window = &surface_state.window;
+                    if let Some(layer) = Self::metal_layer_from_surface(&surface_state.surface) {
+                        self.released_layers.insert(*viewport_id, layer);
+                    }
+                }
+            }
+
+            self.surfaces.clear();
+            self.depth_texture_view.clear();
+            self.msaa_texture_view.clear();
+            self.screen_capture_state = None;
+            self.render_state = None;
+        }
+        self.released = true;
+    }
+
+    /// Allow [`Self::set_window`] to create a device and surfaces again.
+    ///
+    /// Does not create them itself.
+    pub fn restore_gpu(&mut self) {
+        self.released = false;
+    }
+
+    /// Whether [`Self::release_gpu`] has run and [`Self::restore_gpu`] has not.
+    pub fn is_released(&self) -> bool {
+        self.released
+    }
+
+    /// Drop one texture saved by [`Self::release_gpu`].
+    ///
+    /// Called for frees that arrive while the device is released, so that texture
+    /// is not uploaded again when the device is recreated.
+    pub fn forget_snapshot_texture(&mut self, id: egui::TextureId) {
+        self.snapshot.retain(|(texture_id, _, _)| *texture_id != id);
+    }
+
+    /// Byte size of textures saved by [`Self::release_gpu`] (`width * height * 4` per image).
+    pub fn snapshot_bytes(&self) -> usize {
+        self.snapshot
+            .iter()
+            .map(|(_, image, _)| image.size[0] * image.size[1] * 4)
+            .sum()
+    }
+
+    /// Upload textures saved by [`Self::release_gpu`] into a freshly built renderer, then clear them.
+    fn upload_texture_snapshot(&mut self) {
+        let snapshot = std::mem::take(&mut self.snapshot);
+        let Some(render_state) = self.render_state.as_ref() else {
+            self.snapshot = snapshot;
+            return;
+        };
+        let mut renderer = render_state.renderer.write();
+        for (id, image, options) in snapshot {
+            let delta = epaint::ImageDelta::full(image, options);
+            renderer.update_texture(&render_state.device, &render_state.queue, id, &delta);
+        }
+    }
+
+    /// Drop the device and every surface for good: no texture readback, as nothing is restored.
     pub fn destroy(&mut self) {
-        // TODO(emilk): something here?
+        self.surfaces.clear();
+        self.depth_texture_view.clear();
+        self.msaa_texture_view.clear();
+        self.screen_capture_state = None;
+        self.render_state = None;
+        self.snapshot.clear();
+        #[cfg(all(target_os = "macos", feature = "macos-window-resize-jitter-fix"))]
+        self.released_layers.clear();
     }
 }

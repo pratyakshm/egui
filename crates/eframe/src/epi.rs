@@ -654,6 +654,31 @@ impl core::str::FromStr for Renderer {
 
 // ----------------------------------------------------------------------------
 
+/// GPU residency reported by [`Frame::gpu_state`].
+///
+/// Only macOS wgpu ever leaves [`GpuState::Active`].
+/// [`Frame::release_gpu`] and [`Frame::request_gpu`] do nothing on every other backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuState {
+    /// Device is alive and painting at full resolution.
+    Active,
+
+    /// Next paint is half resolution. A successful one then drops the device.
+    LowRes,
+
+    /// Device is dropped. [`App::logic`] still runs. UI and paint do not.
+    Released,
+}
+
+/// One-shot request from [`Frame::release_gpu`] / [`Frame::request_gpu`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GpuRequest {
+    #[default]
+    None,
+    Release,
+    Restore,
+}
+
 /// Represents the surroundings of your app.
 ///
 /// It provides methods to inspect the surroundings (are we on the web?),
@@ -690,6 +715,16 @@ pub struct Frame {
     /// Raw platform display handle for window
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) raw_display_handle: Result<RawDisplayHandle, HandleError>,
+
+    /// Copied from the integration before the pass. [`GpuState::Active`] on every backend except macOS wgpu.
+    pub(crate) gpu_state: GpuState,
+
+    /// Set by [`Frame::release_gpu`] / [`Frame::request_gpu`]. The integration clears it after the pass.
+    #[cfg_attr(
+        not(all(not(target_arch = "wasm32"), feature = "wgpu_no_default_features")),
+        expect(dead_code, reason = "only the native wgpu integration reads it")
+    )]
+    pub(crate) gpu_request: GpuRequest,
 }
 
 // Implementing `Clone` would violate the guarantees of `HasWindowHandle` and `HasDisplayHandle`.
@@ -733,6 +768,8 @@ impl Frame {
             storage: None,
             #[cfg(feature = "wgpu_no_default_features")]
             wgpu_render_state: None,
+            gpu_state: GpuState::Active,
+            gpu_request: GpuRequest::None,
         }
     }
 
@@ -824,6 +861,29 @@ impl Frame {
         if let Some(state) = &mut self.wgpu_render_state {
             state.surface_config = config;
         }
+    }
+
+    /// Drop the GPU while idle.
+    ///
+    /// Honored on macOS wgpu only, and only from [`GpuState::Active`].
+    /// This pass still paints at full resolution. The next pass paints at half
+    /// resolution, then the device is released. Elsewhere the call is ignored.
+    pub fn release_gpu(&mut self) {
+        self.gpu_request = GpuRequest::Release;
+    }
+
+    /// Bring the GPU back after [`Self::release_gpu`].
+    ///
+    /// From [`GpuState::LowRes`] this cancels the release and the next paint is full resolution.
+    /// From [`GpuState::Released`] the next pass recreates the device.
+    /// No-op on every backend except macOS wgpu.
+    pub fn request_gpu(&mut self) {
+        self.gpu_request = GpuRequest::Restore;
+    }
+
+    /// [`GpuState::Active`] on every backend except macOS wgpu.
+    pub fn gpu_state(&self) -> GpuState {
+        self.gpu_state
     }
 }
 
